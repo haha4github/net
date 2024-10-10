@@ -33,6 +33,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/idna"
@@ -186,6 +187,9 @@ type Transport struct {
 	connPoolOrDef ClientConnPool // non-nil version of ConnPool
 
 	*transportTestHooks
+
+	// UTLSConfig is the configuration for the UTLS library.
+	UTLSConfig *utls.Config
 }
 
 // Hook points used for testing.
@@ -725,6 +729,23 @@ func (t *Transport) newTLSConfig(host string) *tls.Config {
 }
 
 func (t *Transport) dialTLS(ctx context.Context, network, addr string, tlsCfg *tls.Config) (net.Conn, error) {
+	if t.UTLSConfig != nil {
+		dialer := &net.Dialer{Timeout: 30 * time.Second}
+		plainConn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		uTLSConn := utls.UClient(plainConn, t.UTLSConfig, utls.HelloChrome_Auto)
+		err = uTLSConn.Handshake()
+		if err != nil {
+			plainConn.Close()
+			return nil, err
+		}
+
+		return uTLSConn, nil
+	}
+
 	if t.DialTLSContext != nil {
 		return t.DialTLSContext(ctx, network, addr, tlsCfg)
 	} else if t.DialTLS != nil {
@@ -792,6 +813,28 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 		pings:                 make(map[[8]byte]chan struct{}),
 		reqHeaderMu:           make(chan struct{}, 1),
 	}
+
+	if tc, ok := c.(*utls.UConn); ok {
+		uState := tc.ConnectionState()
+		cc.tlsState = &tls.ConnectionState{
+			Version:                     uState.Version,
+			HandshakeComplete:           uState.HandshakeComplete,
+			DidResume:                   uState.DidResume,
+			CipherSuite:                 uState.CipherSuite,
+			NegotiatedProtocol:          uState.NegotiatedProtocol,
+			NegotiatedProtocolIsMutual:  uState.NegotiatedProtocolIsMutual,
+			ServerName:                  uState.ServerName,
+			PeerCertificates:            uState.PeerCertificates,
+			VerifiedChains:              uState.VerifiedChains,
+			SignedCertificateTimestamps: uState.SignedCertificateTimestamps,
+			OCSPResponse:                uState.OCSPResponse,
+			TLSUnique:                   uState.TLSUnique,
+		}
+	} else if tc, ok := c.(*tls.Conn); ok {
+		cc.tlsState = new(tls.ConnectionState)
+		*cc.tlsState = tc.ConnectionState()
+	}
+
 	if t.transportTestHooks != nil {
 		t.markNewGoroutine()
 		t.transportTestHooks.newclientconn(cc)
