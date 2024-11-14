@@ -461,7 +461,8 @@ func (st *serverTester) greetAndCheckSettings(checkSetting func(s Setting) error
 			if f.FrameHeader.StreamID != 0 {
 				st.t.Fatalf("WindowUpdate StreamID = %d; want 0", f.FrameHeader.StreamID)
 			}
-			incr := uint32(st.sc.srv.initialConnRecvWindowSize() - initialWindowSize)
+			conf := configFromServer(st.sc.hs, st.sc.srv)
+			incr := uint32(conf.MaxUploadBufferPerConnection - initialWindowSize)
 			if f.Increment != incr {
 				st.t.Fatalf("WindowUpdate increment = %d; want %d", f.Increment, incr)
 			}
@@ -589,11 +590,12 @@ func (st *serverTester) bodylessReq1(headers ...string) {
 }
 
 func (st *serverTester) wantFlowControlConsumed(streamID, consumed int32) {
+	conf := configFromServer(st.sc.hs, st.sc.srv)
 	var initial int32
 	if streamID == 0 {
-		initial = st.sc.srv.initialConnRecvWindowSize()
+		initial = conf.MaxUploadBufferPerConnection
 	} else {
-		initial = st.sc.srv.initialStreamRecvWindowSize()
+		initial = conf.MaxUploadBufferPerStream
 	}
 	donec := make(chan struct{})
 	st.sc.sendServeMsg(func(sc *serverConn) {
@@ -4673,4 +4675,79 @@ func TestServerSetReadWriteDeadlineRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+}
+
+func TestServerWriteByteTimeout(t *testing.T) {
+	const timeout = 1 * time.Second
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Write(make([]byte, 100))
+	}, func(s *Server) {
+		s.WriteByteTimeout = timeout
+	})
+	st.greet()
+
+	st.cc.(*synctestNetConn).SetReadBufferSize(1) // write one byte at a time
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: st.encodeHeader(),
+		EndStream:     true,
+		EndHeaders:    true,
+	})
+
+	// Read a few bytes, staying just under WriteByteTimeout.
+	for i := 0; i < 10; i++ {
+		st.advance(timeout - 1)
+		if n, err := st.cc.Read(make([]byte, 1)); n != 1 || err != nil {
+			t.Fatalf("read %v: %v, %v; want 1, nil", i, n, err)
+		}
+	}
+
+	// Wait for WriteByteTimeout.
+	// The connection should close.
+	st.advance(1 * time.Second) // timeout after writing one byte
+	st.advance(1 * time.Second) // timeout after failing to write any more bytes
+	st.wantClosed()
+}
+
+func TestServerPingSent(t *testing.T) {
+	const readIdleTimeout = 15 * time.Second
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+	}, func(s *Server) {
+		s.ReadIdleTimeout = readIdleTimeout
+	})
+	st.greet()
+
+	st.wantIdle()
+
+	st.advance(readIdleTimeout)
+	_ = readFrame[*PingFrame](t, st)
+	st.wantIdle()
+
+	st.advance(14 * time.Second)
+	st.wantIdle()
+	st.advance(1 * time.Second)
+	st.wantClosed()
+}
+
+func TestServerPingResponded(t *testing.T) {
+	const readIdleTimeout = 15 * time.Second
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+	}, func(s *Server) {
+		s.ReadIdleTimeout = readIdleTimeout
+	})
+	st.greet()
+
+	st.wantIdle()
+
+	st.advance(readIdleTimeout)
+	pf := readFrame[*PingFrame](t, st)
+	st.wantIdle()
+
+	st.advance(14 * time.Second)
+	st.wantIdle()
+
+	st.writePing(true, pf.Data)
+
+	st.advance(2 * time.Second)
+	st.wantIdle()
 }

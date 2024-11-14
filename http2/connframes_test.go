@@ -6,7 +6,6 @@ package http2
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"net/http"
 	"os"
@@ -262,6 +261,24 @@ func (tf *testConnFramer) wantRSTStream(streamID uint32, code ErrCode) {
 	}
 }
 
+func (tf *testConnFramer) wantSettings(want map[SettingID]uint32) {
+	fr := readFrame[*SettingsFrame](tf.t, tf)
+	if fr.Header().Flags.Has(FlagSettingsAck) {
+		tf.t.Errorf("got SETTINGS frame with ACK set, want no ACK")
+	}
+	for wantID, wantVal := range want {
+		gotVal, ok := fr.Value(wantID)
+		if !ok {
+			tf.t.Errorf("SETTINGS: %v is not set, want %v", wantID, wantVal)
+		} else if gotVal != wantVal {
+			tf.t.Errorf("SETTINGS: %v is %v, want %v", wantID, gotVal, wantVal)
+		}
+	}
+	if tf.t.Failed() {
+		tf.t.Fatalf("%v", fr)
+	}
+}
+
 func (tf *testConnFramer) wantSettingsAck() {
 	tf.t.Helper()
 	fr := readFrame[*SettingsFrame](tf.t, tf)
@@ -295,7 +312,7 @@ func (tf *testConnFramer) wantClosed() {
 	if err == nil {
 		tf.t.Fatalf("got unexpected frame (want closed connection): %v", fr)
 	}
-	if err == context.DeadlineExceeded {
+	if err == os.ErrDeadlineExceeded {
 		tf.t.Fatalf("connection is not closed; want it to be")
 	}
 }
@@ -306,7 +323,7 @@ func (tf *testConnFramer) wantIdle() {
 	if err == nil {
 		tf.t.Fatalf("got unexpected frame (want idle connection): %v", fr)
 	}
-	if err != context.DeadlineExceeded {
+	if err != os.ErrDeadlineExceeded {
 		tf.t.Fatalf("got unexpected frame error (want idle connection): %v", err)
 	}
 }
